@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GPU Raymarched Black Hole Lensing</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: sans-serif; }
+        canvas { display: block; width: 100vw; height: 100vh; }
+        #ui {
+            position: absolute; top: 20px; left: 20px;
+            background: rgba(10, 10, 10, 0.85);
+            padding: 20px; border-radius: 8px;
+            border: 1px solid rgba(255, 100, 0, 0.4);
+            color: white; width: 300px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.9);
+            backdrop-filter: blur(10px);
+        }
+        h2 { margin: 0 0 15px 0; font-size: 1.2rem; color: #ff9d00; text-transform: uppercase; }
+        .slider-container { margin-bottom: 15px; }
+        .slider-container label { display: flex; justify-content: space-between; font-size: 0.8rem; color: #aaa; margin-bottom: 5px; }
+        input[type="range"] { width: 100%; accent-color: #ff9d00; }
+        #instructions {
+            position: absolute; bottom: 20px; width: 100%; text-align: center;
+            color: rgba(255,255,255,0.5); font-size: 0.9rem; pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui">
+        <h2>Gravitational Lensing</h2>
+        
+        <div class="slider-container">
+            <label><span>Event Horizon Radius (Rs)</span> <span id="val-rs">1.0</span></label>
+            <input type="range" id="slider-rs" min="0.1" max="2.0" step="0.1" value="1.0">
+        </div>
+        
+        <div class="slider-container">
+            <label><span>Disk Brightness</span> <span id="val-disk">1.0</span></label>
+            <input type="range" id="slider-disk" min="0.0" max="3.0" step="0.1" value="1.0">
+        </div>
+
+        <div class="slider-container">
+            <label><span>Camera Distance</span> <span id="val-dist">8.0</span></label>
+            <input type="range" id="slider-dist" min="3.0" max="20.0" step="0.5" value="8.0">
+        </div>
+    </div>
+
+    <div id="instructions">Left Click + Drag to look around the spacetime distortion</div>
+
+    <!-- Three.js Library -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+    <script>
+        // --- Shaders ---
+        
+        // Vertex Shader: A simple pass-through for a full-screen quad
+        const vertexShader = `
+            varying vec2 vUv;
+            void main() {
+                vUv = uv;
+                gl_Position = vec4(position, 1.0);
+            }
+        `;
+
+        // Fragment Shader: The heart of the physics engine
+        const fragmentShader = `
+            uniform vec2 u_resolution;
+            uniform mat4 u_cameraWorldMatrix;
+            uniform mat4 u_cameraProjectionMatrixInverse;
+            uniform float u_rs;
+            uniform float u_diskBrightness;
+            uniform float u_time;
+            
+            varying vec2 vUv;
+
+            // Procedural Starfield Generation
+            vec3 getStars(vec3 dir) {
+                // Scale direction to create a grid of stars
+                vec3 p = dir * 300.0;
+                
+                // Hash function for pseudo-randomness
+                float h = fract(sin(dot(floor(p), vec3(12.9898, 78.233, 45.164))) * 43758.5453);
+                
+                vec3 color = vec3(0.0);
+                if (h > 0.995) color = vec3(1.0); // Bright stars
+                else if (h > 0.985) color = vec3(0.6, 0.8, 1.0); // Blueish stars
+                else if (h > 0.975) color = vec3(1.0, 0.8, 0.6); // Reddish stars
+                
+                // Add a faint milky way band along the galactic plane
+                float band = exp(-pow(dir.y * 4.0, 2.0));
+                color += vec3(0.05, 0.02, 0.08) * band;
+                
+                return color;
+            }
+
+            // Procedural Accretion Disk Texture
+            vec3 getDiskColor(float r, vec3 hitPos) {
+                if (r < u_rs * 1.5 || r > u_rs * 8.0) return vec3(0.0);
+                
+                // Inverse square falloff for intensity
+                float intensity = 1.0 / pow((r - u_rs * 1.0), 1.5);
+                
+                // Add some swirling noise based on position and time
+                float angle = atan(hitPos.z, hitPos.x);
+                float swirl = sin(angle * 10.0 - u_time * 2.0 + r * 5.0) * 0.5 + 0.5;
+                
+                vec3 baseColor = mix(vec3(1.0, 0.3, 0.0), vec3(1.0, 0.8, 0.4), swirl);
+                
+                // Fade out edges
+                float edgeFade = smoothstep(u_rs * 8.0, u_rs * 5.0, r);
+                
+                return baseColor * intensity * edgeFade * u_diskBrightness;
+            }
+
+            void main() {
+                // 1. Convert screen pixel to a 3D ray from the camera
+                vec2 uv = (vUv - 0.5) * 2.0;
+                vec4 target = u_cameraProjectionMatrixInverse * vec4(uv.x, uv.y, 1.0, 1.0);
+                vec3 rayDir = (u_cameraWorldMatrix * vec4(normalize(target.xyz / target.w), 0.0)).xyz;
+                vec3 rayPos = (u_cameraWorldMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+
+                rayDir = normalize(rayDir);
+                
+                vec3 finalColor = vec3(0.0);
+                bool hitEventHorizon = false;
+                
+                // 2. Numerical Integration (Raymarching curved spacetime)
+                // We use a variable step size. Large steps far away, tiny steps near the black hole.
+                float dt = 0.1; 
+                vec3 diskAccumulation = vec3(0.0);
+                
+                for(int i = 0; i < 150; i++) {
+                    float r = length(rayPos);
+                    
+                    // Check if absorbed by the Event Horizon
+                    if (r < u_rs) {
+                        hitEventHorizon = true;
+                        break;
+                    }
+                    
+                    // -- The Physics: Geodesic Equation Approximation --
+                    // Vector pointing to black hole
+                    vec3 rHat = -normalize(rayPos); 
+                    
+                    // Specific angular momentum h = r x v
+                    vec3 h = cross(rayPos, rayDir);
+                    float h2 = dot(h, h);
+                    
+                    // General Relativity Acceleration Magnitude
+                    // a = -GM/r^2 - 3GM(h^2)/r^4  (Using c=1, G=1, M = Rs/2)
+                    float GM = u_rs * 0.5;
+                    float accelMag = (GM / (r * r)) + (3.0 * GM * h2 / (r * r * r * r));
+                    
+                    // Apply acceleration to ray direction
+                    rayDir += rHat * accelMag * dt;
+                    rayDir = normalize(rayDir); // Photons always travel at c=1
+                    
+                    // Move the ray forward
+                    vec3 nextPos = rayPos + rayDir * dt;
+                    
+                    // -- Accretion Disk Check --
+                    // If the ray crossed the XZ plane (y=0) during this step
+                    if (sign(rayPos.y) != sign(nextPos.y)) {
+                        // Interpolate exact hit position on the plane
+                        float fraction = abs(rayPos.y) / abs(nextPos.y - rayPos.y);
+                        vec3 hitPos = mix(rayPos, nextPos, fraction);
+                        float hitR = length(hitPos);
+                        
+                        diskAccumulation += getDiskColor(hitR, hitPos);
+                    }
+                    
+                    rayPos = nextPos;
+                    
+                    // Adaptive step size: further away from BH = faster raymarch
+                    dt = 0.05 + 0.1 * r;
+                    
+                    // If ray escaped far enough away, stop marching to save GPU cycles
+                    if (r > 30.0) break;
+                }
+                
+                // 3. Render Output
+                if (hitEventHorizon) {
+                    finalColor = diskAccumulation; // Only show disk glowing in front of it
+                } else {
+                    // Sample the starfield using the completely warped ray direction!
+                    vec3 stars = getStars(rayDir);
+                    finalColor = stars + diskAccumulation;
+                }
+                
+                // Tone mapping for bright disk lights
+                finalColor = finalColor / (1.0 + finalColor);
+                // Gamma correction
+                finalColor = pow(finalColor, vec3(1.0 / 2.2));
+
+                gl_FragColor = vec4(finalColor, 1.0);
+            }
+        `;
+
+        // --- Three.js Setup ---
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        
+        let camDist = parseFloat(document.getElementById('slider-dist').value);
+        camera.position.set(0, camDist * 0.2, camDist); // Slightly elevated angle
+
+        const renderer = new THREE.WebGLRenderer();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // Cap pixel ratio for performance
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.enablePan = false;
+        controls.minDistance = 3.0;
+        controls.maxDistance = 30.0;
+
+        // Custom Shader Material applied to a full-screen quad
+        const uniforms = {
+            u_resolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+            u_cameraWorldMatrix: { value: camera.matrixWorld },
+            u_cameraProjectionMatrixInverse: { value: camera.projectionMatrixInverse },
+            u_rs: { value: parseFloat(document.getElementById('slider-rs').value) },
+            u_diskBrightness: { value: parseFloat(document.getElementById('slider-disk').value) },
+            u_time: { value: 0.0 }
+        };
+
+        const material = new THREE.ShaderMaterial({
+            vertexShader: vertexShader,
+            fragmentShader: fragmentShader,
+            uniforms: uniforms,
+            depthWrite: false,
+            depthTest: false
+        });
+
+        // A simple plane geometry covering the entire screen (-1 to +1 in NDC)
+        const geometry = new THREE.PlaneGeometry(2, 2);
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.frustumCulled = false; // Never cull the full-screen quad
+        scene.add(mesh);
+
+        // --- UI Listeners ---
+        document.getElementById('slider-rs').addEventListener('input', (e) => {
+            const val = parseFloat(e.target.value);
+            document.getElementById('val-rs').innerText = val.toFixed(1);
+            uniforms.u_rs.value = val;
+        });
+
+        document.getElementById('slider-disk').addEventListener('input', (e) => {
+            const val = parseFloat(e.target.value);
+            document.getElementById('val-disk').innerText = val.toFixed(1);
+            uniforms.u_diskBrightness.value = val;
+        });
+
+        document.getElementById('slider-dist').addEventListener('input', (e) => {
+            const val = parseFloat(e.target.value);
+            document.getElementById('val-dist').innerText = val.toFixed(1);
+            // Move camera while maintaining rotation
+            const dir = new THREE.Vector3().subVectors(camera.position, controls.target).normalize();
+            camera.position.copy(controls.target).add(dir.multiplyScalar(val));
+        });
+
+        // --- Render Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+
+            // Update uniforms based on camera movement
+            uniforms.u_cameraWorldMatrix.value.copy(camera.matrixWorld);
+            uniforms.u_cameraProjectionMatrixInverse.value.copy(camera.projectionMatrixInverse);
+            uniforms.u_time.value = clock.getElapsedTime();
+
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            uniforms.u_resolution.value.set(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+    </script>
+</body>
+</html>
